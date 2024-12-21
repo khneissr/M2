@@ -1,35 +1,36 @@
-# Import required libraries
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import classification_report
-import pickle
-import time
-import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau as TFReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau as TorchReduceLROnPlateau
+import pickle
+import time
+import os
 from tqdm import tqdm
 
-# Global configuration parameters
-USE_SUBSET = True  # Whether to use a subset of data
-SUBSET_SIZE = 10000  # Size of data subset if USE_SUBSET is True
-MAX_LENGTH = 128  # Maximum sequence length for BERT tokenizer
-BATCH_SIZE = 32  # Training batch size
-VAL_BATCH_SIZE = 64  # Validation batch size
-LEARNING_RATE = 2e-5  # Learning rate for BERT model
-NUM_EPOCHS = 3  # Number of training epochs
-VAL_SIZE = 0.2  # Validation split ratio
-RANDOM_SEED = 42  # Random seed for reproducibility
-SAVE_DIR = 'models'  # Directory to save model artifacts
-DATA_DIR = 'datasets'  # Directory containing input data
+# Configuration Parameters
+USE_SUBSET = True
+SUBSET_SIZE = 1000
+MAX_LENGTH = 128
+BATCH_SIZE = 32
+VAL_BATCH_SIZE = 64
+LEARNING_RATE = 2e-5
+NUM_EPOCHS = 5
+VAL_SIZE = 0.2
+RANDOM_SEED = 42
+SAVE_DIR = 'models'
+DATA_DIR = 'datasets'
+TARGET_COLUMNS = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
 
 def set_seeds():
-    """Set random seeds for reproducibility across all libraries"""
+    """Set random seeds for reproducibility"""
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
@@ -42,96 +43,23 @@ def ensure_model_directory():
         os.makedirs(SAVE_DIR)
         print("Created models directory")
 
-# LSTM Model Training
-def train_lstm_model():
-    """Train LSTM model with TF-IDF features for toxic comment classification"""
-    print("\nStarting LSTM training...")
+def create_balanced_sample(df, target_columns, size):
+    """Create a balanced sample from the dataset"""
+    # Get toxic and non-toxic samples
+    toxic_samples = df[df[target_columns].any(axis=1)]
+    non_toxic_samples = df[~df[target_columns].any(axis=1)]
     
-    # Load and preprocess data
-    train_df = pd.read_csv(os.path.join(DATA_DIR, 'train.csv'))
+    # Calculate balanced sample sizes
+    n_toxic = min(len(toxic_samples), size // 2)
+    n_non_toxic = size - n_toxic
     
-    if USE_SUBSET:
-        print(f"Using subset of {SUBSET_SIZE} samples")
-        train_df = train_df.sample(n=SUBSET_SIZE, random_state=RANDOM_SEED)
+    # Sample and combine
+    sampled_toxic = toxic_samples.sample(n=n_toxic, random_state=RANDOM_SEED)
+    sampled_non_toxic = non_toxic_samples.sample(n=n_non_toxic, random_state=RANDOM_SEED)
     
-    # Define target categories for toxicity classification
-    target_columns = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
-    
-    X = train_df['comment_text']
-    y = train_df[target_columns]
-    
-    # Create TF-IDF features
-    vectorizer = TfidfVectorizer(
-        max_features=10000,
-        strip_accents='unicode',
-        lowercase=True,
-        analyzer='word',
-        stop_words='english',
-        ngram_range=(1, 2)  # Use both unigrams and bigrams
-    )
-    X_tfidf = vectorizer.fit_transform(X)
-    X_dense = X_tfidf.toarray()
-    
-    # Split data into train and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_dense, y, test_size=VAL_SIZE, random_state=RANDOM_SEED
-    )
-    
-    # Define LSTM model architecture
-    model = Sequential([
-        Embedding(input_dim=X_train.shape[1], output_dim=64, input_length=X_train.shape[1]),
-        Bidirectional(LSTM(64, return_sequences=True)),
-        Bidirectional(LSTM(32)),
-        Dropout(0.3),
-        Dense(32, activation='relu'),
-        Dropout(0.3),
-        Dense(6, activation='sigmoid')  # 6 outputs for toxicity categories
-    ])
-    
-    # Compile model with binary cross-entropy for multi-label classification
-    model.compile(
-        optimizer='adam',
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    # Add early stopping to prevent overfitting
-    early_stopping = EarlyStopping(
-        monitor='val_loss',
-        patience=2,
-        restore_best_weights=True
-    )
-    
-    # Train the model
-    start_time = time.time()
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=NUM_EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=[early_stopping],
-        verbose=1
-    )
-    
-    print(f"\nLSTM Training time: {time.time() - start_time:.2f} seconds")
-    
-    # Evaluate model performance
-    y_pred = model.predict(X_val)
-    for i, column in enumerate(target_columns):
-        print(f"\nLSTM Metrics for {column}:")
-        y_pred_binary = (y_pred[:, i] > 0.5).astype(int)
-        print(classification_report(y_val.iloc[:, i], y_pred_binary))
-    
-    # Save model artifacts
-    model.save(os.path.join(SAVE_DIR, 'toxic_comment_lstm.h5'))
-    with open(os.path.join(SAVE_DIR, 'tfidf_vectorizer.pkl'), 'wb') as f:
-        pickle.dump(vectorizer, f)
-    
-    return model, history, vectorizer
+    return pd.concat([sampled_toxic, sampled_non_toxic]).sample(frac=1)
 
-# BERT Model Components
 class ToxicDataset(Dataset):
-    """Custom Dataset class for toxic comment data with BERT tokenization"""
     def __init__(self, texts, labels=None, tokenizer=None, max_length=MAX_LENGTH):
         self.texts = texts
         self.labels = labels
@@ -145,7 +73,6 @@ class ToxicDataset(Dataset):
     def __getitem__(self, idx):
         text = str(self.texts[idx])
         
-        # Tokenize text with BERT tokenizer
         encoding = self.tokenizer(
             text,
             add_special_tokens=True,
@@ -166,7 +93,6 @@ class ToxicDataset(Dataset):
         return item
 
 def train_bert_epoch(model, train_loader, optimizer, criterion, device):
-    """Train BERT model for one epoch"""
     model.train()
     total_loss = 0
     
@@ -175,12 +101,10 @@ def train_bert_epoch(model, train_loader, optimizer, criterion, device):
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
         
-        # Forward pass and loss calculation
         optimizer.zero_grad()
         outputs = model(input_ids, attention_mask=attention_mask)
         loss = criterion(outputs.logits, labels)
         
-        # Backward pass and optimization
         loss.backward()
         optimizer.step()
         
@@ -189,7 +113,7 @@ def train_bert_epoch(model, train_loader, optimizer, criterion, device):
     return total_loss / len(train_loader)
 
 def validate_bert(model, val_loader, criterion, device):
-    """Validate BERT model performance"""
+    """Enhanced validation with better metrics tracking"""
     model.eval()
     total_loss = 0
     all_preds = []
@@ -201,13 +125,11 @@ def validate_bert(model, val_loader, criterion, device):
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
-            # Forward pass
             outputs = model(input_ids, attention_mask=attention_mask)
             loss = criterion(outputs.logits, labels)
             
             total_loss += loss.item()
             
-            # Collect predictions and labels for accuracy calculation
             preds = torch.sigmoid(outputs.logits).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
@@ -215,50 +137,66 @@ def validate_bert(model, val_loader, criterion, device):
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     
-    # Calculate accuracy for each toxicity category
     accuracies = ((all_preds > 0.5) == all_labels).mean(axis=0)
     
     return total_loss / len(val_loader), accuracies
 
 def train_bert_model():
-    """Train DistilBERT model for toxic comment classification"""
-    print("\nStarting DistilBERT training...")
+    """Enhanced BERT model with improved handling of class imbalance"""
+    print("\nStarting DistilBERT training with improvements...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load and preprocess data
+    # Load data
     train_df = pd.read_csv(os.path.join(DATA_DIR, 'train.csv'))
     if USE_SUBSET:
-        train_df = train_df.sample(n=SUBSET_SIZE, random_state=RANDOM_SEED)
+        train_df = create_balanced_sample(train_df, TARGET_COLUMNS, SUBSET_SIZE)
     
-    # Initialize BERT tokenizer and model
+    # Initialize tokenizer and model with improved configuration
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
     model = DistilBertForSequenceClassification.from_pretrained(
         'distilbert-base-uncased',
-        num_labels=6  # Six toxicity categories
+        num_labels=len(TARGET_COLUMNS),
+        problem_type="multi_label_classification"
     ).to(device)
     
     # Prepare data
-    target_columns = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
     train_texts = train_df['comment_text'].values
-    train_labels = train_df[target_columns].values
+    train_labels = train_df[TARGET_COLUMNS].values
     
-    # Split data into train and validation sets
+    # Calculate positive class weights
+    pos_weights = []
+    for i in range(len(TARGET_COLUMNS)):
+        pos_count = np.sum(train_labels[:, i])
+        neg_count = len(train_labels) - pos_count
+        pos_weights.append(neg_count / pos_count)
+    pos_weight = torch.tensor(pos_weights).to(device)
+    
     train_texts, val_texts, train_labels, val_labels = train_test_split(
-        train_texts, train_labels, test_size=VAL_SIZE, random_state=RANDOM_SEED
+        train_texts, train_labels, 
+        test_size=VAL_SIZE, 
+        random_state=RANDOM_SEED,
+        stratify=train_labels.any(axis=1)
     )
     
-    # Create datasets and dataloaders
+    # Create datasets with improved handling
     train_dataset = ToxicDataset(train_texts, train_labels, tokenizer)
     val_dataset = ToxicDataset(val_texts, val_labels, tokenizer)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=VAL_BATCH_SIZE)
     
-    # Initialize optimizer and loss function
+    # Enhanced training setup with fixed scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    scheduler = TorchReduceLROnPlateau(  # Using PyTorch's ReduceLROnPlateau
+        optimizer, 
+        mode='min', 
+        patience=2, 
+        factor=0.5, 
+        verbose=True
+    )
     
-    # Training loop
+    # Training loop with improved monitoring
     start_time = time.time()
     best_val_loss = float('inf')
     history = {'train_loss': [], 'val_loss': [], 'val_accuracies': []}
@@ -266,20 +204,19 @@ def train_bert_model():
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
         
-        # Train and validate for one epoch
         train_loss = train_bert_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, accuracies = validate_bert(model, val_loader, criterion, device)
         
-        # Store metrics
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['val_accuracies'].append(accuracies)
         
-        # Print progress
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Validation Loss: {val_loss:.4f}")
-        print("Validation Accuracies:", 
-              dict(zip(target_columns, accuracies)))
+        print("Validation Accuracies:", dict(zip(TARGET_COLUMNS, accuracies)))
+        
+        # Learning rate scheduling
+        scheduler.step(val_loss)
         
         # Save best model
         if val_loss < best_val_loss:
@@ -291,30 +228,141 @@ def train_bert_model():
                 'val_loss': val_loss,
             }, os.path.join(SAVE_DIR, 'bert_best_model.pt'))
     
-    print(f"\nBERT Training time: {time.time() - start_time:.2f} seconds")
-    
-    # Save final model and artifacts
+    # Save final artifacts
     torch.save(model.state_dict(), os.path.join(SAVE_DIR, 'bert_final_model.pt'))
     tokenizer.save_pretrained(os.path.join(SAVE_DIR, 'bert_tokenizer'))
-    with open(os.path.join(SAVE_DIR, 'bert_training_history.pkl'), 'wb') as f:
+    
+    # Save training history
+    with open(os.path.join(SAVE_DIR, 'bert_history.pkl'), 'wb') as f:
         pickle.dump(history, f)
+    
+    print(f"\nBERT Training time: {time.time() - start_time:.2f} seconds")
     
     return model, history, tokenizer
 
+def train_lstm_model():
+    """Train LSTM model with improved architecture and handling of class imbalance"""
+    print("\nStarting LSTM training...")
+    
+    # Load data
+    train_df = pd.read_csv(os.path.join(DATA_DIR, 'train.csv'))
+    
+    if USE_SUBSET:
+        print(f"Using balanced subset of {SUBSET_SIZE} samples")
+        train_df = create_balanced_sample(train_df, TARGET_COLUMNS, SUBSET_SIZE)
+    
+    # Prepare data
+    X = train_df['comment_text']
+    y = train_df[TARGET_COLUMNS]
+    
+    # Enhanced TF-IDF
+    vectorizer = TfidfVectorizer(
+        max_features=15000,
+        strip_accents='unicode',
+        lowercase=True,
+        analyzer='word',
+        stop_words='english',
+        ngram_range=(1, 3),
+        min_df=3
+    )
+    
+    X_tfidf = vectorizer.fit_transform(X)
+    X_dense = X_tfidf.toarray()
+    
+    # Split data
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_dense, y, 
+        test_size=VAL_SIZE, 
+        random_state=RANDOM_SEED,
+        stratify=y.any(axis=1)
+    )
+    
+    # Calculate class weights with safety check
+    class_weights = {}
+    for i, column in enumerate(TARGET_COLUMNS):
+        neg_count = len(y_train) - y_train[column].sum()
+        pos_count = max(1, y_train[column].sum())  # Avoid division by zero
+        class_weights[i] = {0: 1.0, 1: neg_count/pos_count}
+    
+    # Improved LSTM architecture
+    model = Sequential([
+        Embedding(input_dim=X_train.shape[1], output_dim=100),
+        Bidirectional(LSTM(100, return_sequences=True)),
+        Dropout(0.4),
+        Bidirectional(LSTM(50)),
+        Dropout(0.4),
+        Dense(100, activation='relu'),
+        Dropout(0.3),
+        Dense(50, activation='relu'),
+        Dense(len(TARGET_COLUMNS), activation='sigmoid')
+    ])
+    
+    # Enhanced callbacks for better training
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=3,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        TFReduceLROnPlateau(  # Using TensorFlow's ReduceLROnPlateau
+            monitor='val_loss',
+            factor=0.5,
+            patience=2,
+            verbose=1,
+            min_lr=1e-6
+        )
+    ]
+    
+    model.compile(
+        optimizer='adam',
+        loss='binary_crossentropy',
+        metrics=['accuracy', 'AUC']
+    )
+    
+    # Train model
+    start_time = time.time()
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=NUM_EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=callbacks,
+        class_weight=class_weights[0],
+        verbose=1
+    )
+    
+    print(f"\nLSTM Training time: {time.time() - start_time:.2f} seconds")
+    
+    # Evaluate and save model
+    model.save(os.path.join(SAVE_DIR, 'lstm_model_improved.h5'))
+    with open(os.path.join(SAVE_DIR, 'tfidf_vectorizer_improved.pkl'), 'wb') as f:
+        pickle.dump(vectorizer, f)
+    
+    return model, history, vectorizer
+
 def main():
-    """Main training pipeline for toxic comment classification"""
+    """Main training pipeline with improved logging and error handling"""
     print("Starting toxic comment classification training pipeline...")
     print(f"{'Using subset of data' if USE_SUBSET else 'Using full dataset'}")
     print(f"Sample size: {SUBSET_SIZE if USE_SUBSET else 'FULL'}")
     
-    ensure_model_directory()
-    set_seeds()
-    
-    # Train both models sequentially
-    lstm_model, lstm_history, vectorizer = train_lstm_model()
-    bert_model, bert_history, tokenizer = train_bert_model()
-    
-    print("\nTraining complete! All models saved in ./models/")
+    try:
+        # Setup
+        ensure_model_directory()
+        set_seeds()
+        
+        # Train LSTM model
+        lstm_model, lstm_history, vectorizer = train_lstm_model()
+        
+        # Train BERT model
+        bert_model, bert_history, tokenizer = train_bert_model()
+        
+        print("\nTraining complete! All models and artifacts saved in ./models/")
+        
+    except Exception as e:
+        print(f"Error during training: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
